@@ -23,7 +23,12 @@
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { createPendingApproval, deletePendingApproval, getSession } from '../../db/sessions.js';
+import {
+  bindPendingApprovalMessage,
+  createPendingApproval,
+  deletePendingApproval,
+  getSession,
+} from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
@@ -267,7 +272,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   const adapter = getDeliveryAdapter();
   if (adapter) {
     try {
-      await adapter.deliver(
+      const messageId = await adapter.deliver(
         target.messagingGroup.channel_type,
         target.messagingGroup.platform_id,
         null,
@@ -282,6 +287,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
         undefined,
         target.messagingGroup.instance,
       );
+      if (messageId) await bindPendingApprovalMessage(approvalId, messageId);
     } catch (err) {
       log.error('Failed to deliver approval card', { action, approvalId, err });
       // The single delivery target never saw the card — remove the row so it
