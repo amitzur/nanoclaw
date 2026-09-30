@@ -16,6 +16,7 @@
  * - Otherwise → QR code (printed to log)
  * Subsequent restarts reuse the saved session automatically.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 // Named import (not default) — pino's .d.ts under NodeNext resolution
@@ -29,6 +30,7 @@ import {
   makeWASocket,
   proto,
   Browsers,
+  decryptPollVote,
   DisconnectReason,
   fetchLatestWaWebVersion,
   downloadMediaMessage,
@@ -110,6 +112,253 @@ const PENDING_QUESTIONS_MAX = 64;
 /** Normalize an option label to a slash command: "Approve" → "/approve" */
 function optionToCommand(option: string): string {
   return '/' + option.toLowerCase().replace(/\s+/g, '-');
+}
+
+/** Compare form of a slash command — tolerant of the trailing "…"/"." some labels carry. */
+function commandKey(cmd: string): string {
+  return cmd
+    .trim()
+    .toLowerCase()
+    .replace(/[….]+$/u, '');
+}
+
+// --- Cards and questions as plain text ---
+//
+// WhatsApp has no interactive cards, so every card shape renders as text and
+// questions are answered by typed replies. Several questions can be pending
+// in one chat at once (e.g. a burst of approvals), so each is tracked by its
+// own id and a reply must identify which one it answers: by quoting the
+// question message, by naming the id (`/approve <id>`), or by being the only
+// pending question the command fits.
+
+/** A question delivered to a chat and still awaiting a typed reply. */
+export interface TrackedQuestion {
+  questionId: string;
+  chatJid: string;
+  title: string;
+  options: NormalizedOption[];
+  /** WhatsApp message id of the delivered question (absent while queued offline). */
+  messageId?: string;
+  /** Poll encryption secret, when the question went out as a native poll. */
+  pollSecret?: Uint8Array;
+  createdAt: number;
+}
+
+/** WhatsApp caps poll titles; longer questions go out as a detail message first. */
+const POLL_NAME_MAX = 250;
+/** WhatsApp polls take at most 12 options. */
+const POLL_OPTIONS_MAX = 12;
+
+export interface QuestionPoll {
+  /** Detail text sent before the poll, when the question doesn't fit in the poll title. */
+  preamble?: string;
+  name: string;
+  values: string[];
+}
+
+/**
+ * Build a native poll for a question: tapping an option answers exactly that
+ * question, so several can be pending without any ambiguity. Returns null
+ * when the options can't form a valid poll (too many, or duplicate labels),
+ * in which case the caller falls back to the text rendering.
+ */
+export function buildQuestionPoll(
+  questionId: string,
+  title: string,
+  question: string,
+  options: NormalizedOption[],
+): QuestionPoll | null {
+  const values = options.map((o) => o.label);
+  if (values.length < 2 || values.length > POLL_OPTIONS_MAX || new Set(values).size !== values.length) return null;
+  const full = [title, question, `ID: ${questionId}`].filter(Boolean).join('\n\n');
+  if (full.length <= POLL_NAME_MAX) return { name: full, values };
+  const preamble = `*${title}*\n\n${question}\n\nID: ${questionId}\n_Vote in the poll below, or send_ ${optionToCommand(values[0])} ${questionId}`;
+  const shortTitle = title.length > POLL_NAME_MAX ? `${title.slice(0, POLL_NAME_MAX - 1)}…` : title;
+  return { preamble, name: shortTitle, values };
+}
+
+/** Strip the device suffix (`123:4@s.whatsapp.net` → `123@s.whatsapp.net`). */
+function bareJid(jid: string): string {
+  const [user, server] = jid.split('@');
+  return `${user.split(':')[0]}@${server}`;
+}
+
+/**
+ * Decrypt a poll vote. The vote key is bound to the exact creator and voter
+ * JID strings the voter's client used, which may be phone or LID form, so
+ * each candidate pair is tried — AES-GCM authentication rejects wrong ones.
+ * Returns the selected option hashes, or null if no pair decrypts.
+ */
+export function decryptPollSelection(
+  vote: proto.Message.IPollEncValue,
+  pollMsgId: string,
+  pollEncKey: Uint8Array,
+  creatorJids: Array<string | null | undefined>,
+  voterJids: Array<string | null | undefined>,
+): Uint8Array[] | null {
+  const creators = [...new Set(creatorJids.filter((j): j is string => !!j).map(bareJid))];
+  const voters = [...new Set(voterJids.filter((j): j is string => !!j).map(bareJid))];
+  for (const pollCreatorJid of creators) {
+    for (const voterJid of voters) {
+      try {
+        const decoded = decryptPollVote(vote, { pollCreatorJid, pollMsgId, pollEncKey, voterJid });
+        return (decoded.selectedOptions ?? []) as Uint8Array[];
+      } catch {
+        // wrong JID pair — try the next
+      }
+    }
+  }
+  return null;
+}
+
+/** Map selected option hashes (sha256 of the option name) back to an option. */
+export function matchPollSelection(options: NormalizedOption[], selected: Uint8Array[]): NormalizedOption | undefined {
+  if (selected.length === 0) return undefined; // vote retracted
+  const hashes = new Set(selected.map((h) => Buffer.from(h).toString('hex')));
+  return options.find((o) => hashes.has(crypto.createHash('sha256').update(o.label).digest('hex')));
+}
+
+/** Render a send_card payload as WhatsApp markdown. Returns '' when there is nothing to show. */
+export function renderCardText(card: Record<string, unknown> | undefined, fallbackText?: string): string {
+  const lines: string[] = [];
+  if (card && typeof card === 'object') {
+    if (typeof card.title === 'string' && card.title) lines.push(`**${card.title}**`);
+    if (typeof card.description === 'string' && card.description) lines.push(card.description);
+    if (Array.isArray(card.children)) {
+      for (const child of card.children) {
+        if (typeof child === 'string' && child) lines.push(child);
+        else if (child && typeof child === 'object' && typeof (child as { text?: unknown }).text === 'string') {
+          const text = (child as { text: string }).text;
+          if (text) lines.push(text);
+        }
+      }
+    }
+    if (Array.isArray(card.actions)) {
+      const links = (card.actions as Array<Record<string, unknown> | null>)
+        .filter((a): a is Record<string, unknown> => !!a && typeof a.url === 'string' && !!a.url)
+        .map((a) => `• ${typeof a.label === 'string' && a.label ? `${a.label}: ` : ''}${a.url as string}`);
+      if (links.length > 0) lines.push(links.join('\n'));
+    }
+  }
+  // Only the title rendered: the fallback text usually says more.
+  const hasBody = lines.length > 1 || (lines.length === 1 && !(card && card.title));
+  if (!hasBody && fallbackText) return fallbackText;
+  return lines.join('\n\n');
+}
+
+/** Render an ask_question payload (agent question or approval) as WhatsApp text. */
+export function renderQuestionText(
+  questionId: string,
+  title: string,
+  question: string,
+  options: NormalizedOption[],
+): string {
+  const optionLines = options.map((o, i) => `  ${i + 1}. ${optionToCommand(o.label)}`).join('\n');
+  const example = options[0] ? `${optionToCommand(options[0].label)} ${questionId}` : questionId;
+  return [
+    `*${title}*`,
+    question,
+    `Reply with:\n${optionLines}`,
+    `ID: ${questionId}\n_If several requests are waiting, quote this message or send_ ${example}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function matchOption(options: NormalizedOption[], reply: string): NormalizedOption | undefined {
+  const text = reply.trim();
+  if (/^\/?\d+$/.test(text)) return options[Number(text.replace('/', '')) - 1];
+  if (text.startsWith('/')) {
+    const key = commandKey(text);
+    return options.find((o) => commandKey(optionToCommand(o.label)) === key);
+  }
+  const lower = text.toLowerCase();
+  return options.find((o) => o.label.toLowerCase() === lower);
+}
+
+export type QuestionReplyResolution =
+  | { kind: 'none' }
+  | { kind: 'answer'; questionId: string; value: string; label: string; tracked: boolean }
+  | { kind: 'ambiguous'; candidates: TrackedQuestion[] };
+
+/**
+ * Decide whether an inbound chat message answers a pending question, and which.
+ *
+ *  1. Quoting a question message → that question; the reply may be a command,
+ *     an option number, or an option label.
+ *  2. `/<command> <id>` → that question. An approval id this adapter isn't
+ *     tracking (e.g. sent before a restart) resolves with the raw approve/reject
+ *     value; the host authorizes the responder either way.
+ *  3. Bare `/<command>` → the single pending question in this chat it fits;
+ *     more than one fit is ambiguous and must not guess.
+ *
+ * Anything else is ordinary conversation and flows to the agent.
+ */
+export function resolveQuestionReply(
+  content: string,
+  chatJid: string,
+  quotedMessageId: string | undefined,
+  pending: Iterable<TrackedQuestion>,
+): QuestionReplyResolution {
+  const text = content.trim();
+  const inChat = [...pending].filter((q) => q.chatJid === chatJid);
+
+  if (quotedMessageId) {
+    const quoted = inChat.find((q) => q.messageId === quotedMessageId);
+    if (quoted) {
+      // A quoted `/approve <id>` still means the quoted question — the command is what counts.
+      const reply = text.startsWith('/') ? text.split(/\s+/)[0] : text;
+      const option = matchOption(quoted.options, reply);
+      if (!option) return { kind: 'none' };
+      return {
+        kind: 'answer',
+        questionId: quoted.questionId,
+        value: option.value,
+        label: option.selectedLabel,
+        tracked: true,
+      };
+    }
+  }
+
+  if (!text.startsWith('/')) return { kind: 'none' };
+  const [cmd, id, ...rest] = text.split(/\s+/);
+  if (rest.length > 0) return { kind: 'none' };
+
+  if (id) {
+    const target = inChat.find((q) => q.questionId === id);
+    if (target) {
+      const option = matchOption(target.options, cmd);
+      if (!option) return { kind: 'none' };
+      return { kind: 'answer', questionId: id, value: option.value, label: option.selectedLabel, tracked: true };
+    }
+    const key = commandKey(cmd);
+    if (id.startsWith('appr-') && (key === '/approve' || key === '/reject')) {
+      const value = key.slice(1);
+      const label = value === 'approve' ? '✅ Approved' : '❌ Rejected';
+      return { kind: 'answer', questionId: id, value, label, tracked: false };
+    }
+    return { kind: 'none' };
+  }
+
+  const candidates = inChat.filter((q) => !!matchOption(q.options, cmd));
+  if (candidates.length === 1) {
+    const option = matchOption(candidates[0].options, cmd)!;
+    return {
+      kind: 'answer',
+      questionId: candidates[0].questionId,
+      value: option.value,
+      label: option.selectedLabel,
+      tracked: true,
+    };
+  }
+  if (candidates.length > 1) return { kind: 'ambiguous', candidates };
+  return { kind: 'none' };
+}
+
+/** Reply sent when a bare command fits several pending questions. */
+export function renderAmbiguousReply(cmd: string, candidates: TrackedQuestion[]): string {
+  const lines = candidates.map((q) => `• ${q.title}\n  ${cmd} ${q.questionId}`);
+  return `${candidates.length} requests are waiting. Quote the one you mean, or send one of:\n\n${lines.join('\n')}`;
 }
 
 // --- Markdown → WhatsApp formatting ---
@@ -437,15 +686,9 @@ registerChannelAdapter('whatsapp', {
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
 
-    // Pending questions: chatJid → { questionId, options }
-    // User replies with /approve, /reject, etc. to answer
-    const pendingQuestions = new Map<
-      string,
-      {
-        questionId: string;
-        options: NormalizedOption[];
-      }
-    >();
+    // Pending questions: questionId → tracked question. Keyed per question, not
+    // per chat — a chat can hold several at once (see resolveQuestionReply).
+    const pendingQuestions = new Map<string, TrackedQuestion>();
 
     // Group sync tracking
     let lastGroupSync = 0;
@@ -845,6 +1088,46 @@ registerChannelAdapter('whatsapp', {
             // Notify metadata for group discovery
             setupConfig.onMetadata(chatJid, undefined, isGroup);
 
+            // Poll vote on a question poll → answer that question. Votes are
+            // never conversation, so they don't flow to the agent either way.
+            if (normalized.pollUpdateMessage) {
+              const update = normalized.pollUpdateMessage;
+              const pollId = update.pollCreationMessageKey?.id;
+              const tracked = [...pendingQuestions.values()].find((q) => q.messageId === pollId && q.pollSecret);
+              if (!tracked || !pollId || !update.vote) {
+                log.debug('Poll vote for an untracked poll — ignoring', { pollId });
+                continue;
+              }
+              const selected = decryptPollSelection(
+                update.vote,
+                pollId,
+                tracked.pollSecret!,
+                [sock.user?.id, sock.user?.lid, botPhoneJid, botLidUser ? `${botLidUser}@lid` : undefined],
+                [msg.key.participant, msg.key.participantAlt, msg.key.remoteJid, msg.key.remoteJidAlt],
+              );
+              if (!selected) {
+                log.warn('Could not decrypt poll vote', { questionId: tracked.questionId, pollId });
+                continue;
+              }
+              const option = matchPollSelection(tracked.options, selected);
+              if (!option) continue; // retracted vote
+              const rawVoter = msg.key.participant || msg.key.remoteJid || '';
+              const voter = rawVoter.endsWith('@lid')
+                ? await translateJid(rawVoter, msg.key.participantAlt ?? msg.key.remoteJidAlt ?? undefined)
+                : rawVoter;
+              const voterName = msg.pushName || voter.split('@')[0];
+              setupConfig.onAction(tracked.questionId, option.value, bareJid(voter));
+              pendingQuestions.delete(tracked.questionId);
+              await sendRawMessage(chatJid, `${option.selectedLabel} by ${voterName} — ${tracked.title}`);
+              log.info('Question answered', {
+                questionId: tracked.questionId,
+                value: option.value,
+                via: 'poll',
+                voterName,
+              });
+              continue;
+            }
+
             let content =
               normalized.conversation ||
               normalized.extendedTextMessage?.text ||
@@ -888,23 +1171,33 @@ registerChannelAdapter('whatsapp', {
 
             const isBotMessage = WHATSAPP_SHARED ? content.startsWith(`${ASSISTANT_NAME}:`) : false;
 
-            // Check if this reply answers a pending question via slash command
-            const pending = pendingQuestions.get(chatJid);
-            if (pending && content.startsWith('/')) {
-              const cmd = content.trim().toLowerCase();
-              const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
-              if (matched) {
-                const voterName = msg.pushName || sender.split('@')[0];
-                setupConfig.onAction(pending.questionId, matched.value, sender);
-                pendingQuestions.delete(chatJid);
-                await sendRawMessage(chatJid, `${matched.selectedLabel} by ${voterName}`);
-                log.info('Question answered', {
-                  questionId: pending.questionId,
-                  value: matched.value,
-                  voterName,
-                });
-                continue; // Don't forward this reply to the agent
-              }
+            // Check if this reply answers a pending question (quote, `/cmd <id>`, or bare `/cmd`)
+            const quotedMessageId = normalized.extendedTextMessage?.contextInfo?.stanzaId ?? undefined;
+            const reply = resolveQuestionReply(content, chatJid, quotedMessageId, pendingQuestions.values());
+            if (reply.kind === 'ambiguous') {
+              await sendRawMessage(chatJid, renderAmbiguousReply(content.trim().split(/\s+/)[0], reply.candidates));
+              log.info('Ambiguous question reply — asked sender to pick', {
+                chatJid,
+                candidates: reply.candidates.map((q) => q.questionId),
+              });
+              continue; // Don't forward this reply to the agent
+            }
+            if (reply.kind === 'answer') {
+              const voterName = msg.pushName || sender.split('@')[0];
+              const title = pendingQuestions.get(reply.questionId)?.title;
+              setupConfig.onAction(reply.questionId, reply.value, sender);
+              pendingQuestions.delete(reply.questionId);
+              await sendRawMessage(
+                chatJid,
+                `${reply.label} by ${voterName}${title ? ` — ${title}` : ''} (${reply.questionId})`,
+              );
+              log.info('Question answered', {
+                questionId: reply.questionId,
+                value: reply.value,
+                tracked: reply.tracked,
+                voterName,
+              });
+              continue; // Don't forward this reply to the agent
             }
 
             // Detect explicit @-mentions of the bot in groups. Detail in
@@ -1006,17 +1299,62 @@ registerChannelAdapter('whatsapp', {
           }
           const options: NormalizedOption[] = normalizeOptions(content.options as never);
 
-          const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
-          const text = `*${title}*\n\n${question}\n\nReply with:\n${optionLines}`;
-          const msgId = await sendRawMessage(platformId, text);
-          if (msgId) {
-            pendingQuestions.set(platformId, { questionId, options });
-            if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
-              const oldest = pendingQuestions.keys().next().value!;
-              pendingQuestions.delete(oldest);
+          // Native poll first: tapping an option answers exactly this question.
+          // Text commands remain as the fallback (offline queue, invalid poll,
+          // or a send failure) and still resolve a poll-delivered question.
+          let msgId: string | undefined;
+          let pollSecret: Uint8Array | undefined;
+          const poll = connected ? buildQuestionPoll(questionId, title, question, options) : null;
+          if (poll) {
+            try {
+              if (poll.preamble) await sendRawMessage(platformId, poll.preamble);
+              const secret = crypto.randomBytes(32);
+              const sent = await sock.sendMessage(platformId, {
+                poll: { name: poll.name, values: poll.values, selectableCount: 1, messageSecret: secret },
+              });
+              if (sent?.key?.id) {
+                msgId = sent.key.id;
+                pollSecret = secret;
+                if (sent.message) sentMessageCache.set(sent.key.id, sent.message);
+              }
+            } catch (err) {
+              log.warn('Failed to send question poll — falling back to text', { questionId, err });
             }
           }
+          if (!msgId)
+            msgId = await sendRawMessage(platformId, renderQuestionText(questionId, title, question, options));
+          // Track even when queued offline (no msgId yet): `/cmd <id>` and
+          // bare commands still resolve it; only quoting and votes need the id.
+          pendingQuestions.set(questionId, {
+            questionId,
+            chatJid: platformId,
+            title,
+            options,
+            messageId: msgId,
+            pollSecret,
+            createdAt: Date.now(),
+          });
+          if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
+            const oldest = pendingQuestions.keys().next().value!;
+            pendingQuestions.delete(oldest);
+          }
           return msgId;
+        }
+
+        // Display card (send_card) → plain text. WhatsApp has no cards; link
+        // actions render as "label: url" lines.
+        if (content.type === 'card') {
+          const cardText = renderCardText(
+            content.card as Record<string, unknown> | undefined,
+            content.fallbackText as string | undefined,
+          );
+          if (!cardText) {
+            log.warn('send_card payload has nothing to render — skipping delivery', { platformId });
+            return;
+          }
+          const { text: formatted, mentions } = formatWhatsApp(cardText);
+          const prefixed = WHATSAPP_SHARED ? `${ASSISTANT_NAME}: ${formatted}` : formatted;
+          return sendRawMessage(platformId, prefixed, mentions);
         }
 
         // Reaction → emoji on a message
@@ -1038,7 +1376,14 @@ registerChannelAdapter('whatsapp', {
         const text = (content.markdown as string) || (content.text as string);
         const hasFiles = message.files && message.files.length > 0;
 
-        if (!text && !hasFiles) return;
+        if (!text && !hasFiles) {
+          log.warn('Outbound message has no renderable content for WhatsApp — skipping delivery', {
+            platformId,
+            type: content.type,
+            operation: content.operation,
+          });
+          return;
+        }
 
         // Send file attachments (first file gets the caption, rest are captionless)
         if (hasFiles) {
