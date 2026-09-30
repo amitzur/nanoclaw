@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@nanoco/nanoclaw-dashboard':
+    hash: c08134b981b538862e8fbbe35f777fdd6fc3c40b83fd941d4db07c2d5ecbc05c
+    path: patches/@nanoco__nanoclaw-dashboard.patch
+
 importers:
 
   .:
@@ -14,6 +19,9 @@ importers:
       '@clack/prompts':
         specifier: ^1.2.0
         version: 1.2.0
+      '@nanoco/nanoclaw-dashboard':
+        specifier: ^0.3.0
+        version: 0.3.0(patch_hash=c08134b981b538862e8fbbe35f777fdd6fc3c40b83fd941d4db07c2d5ecbc05c)
       '@onecli-sh/sdk':
         specifier: 2.2.1
         version: 2.2.1
@@ -504,6 +512,10 @@ packages:
 
   '@keyv/serialize@1.1.1':
     resolution: {integrity: sha512-dXn3FZhPv0US+7dtJsIi2R+c7qWYiReoEh5zUntWCf4oSpMNib8FDhSoed6m3QyZdx5hK7iLFkYk3rNxwt8vTA==}
+
+  '@nanoco/nanoclaw-dashboard@0.3.0':
+    resolution: {integrity: sha512-AT1sLe/PxtSMytMqXOH5xeoFw9gyYpEhXC4XIA4/940Fmw45FWAJfdQzyVRi9JZKhb2b6Qr6nqVfQRgAB3LoaA==}
+    hasBin: true
 
   '@napi-rs/wasm-runtime@1.1.4':
     resolution: {integrity: sha512-3NQNNgA1YSlJb/kMH1ildASP9HW7/7kYnRI2szWJaofaS1hWmbGI4H+d3+22aGzXXN9IJ+n+GiFVcGipJP18ow==}
@@ -1203,7 +1215,7 @@ packages:
     engines: {node: '>= 0.8.0'}
 
   libsignal@https://codeload.github.com/whiskeysockets/libsignal-node/tar.gz/bcea72df9ec34d9d9140ab30619cf479c7c144c7:
-    resolution: {gitHosted: true, integrity: sha512-KmRMuAYSfd4upRD0xOgKbURxRXNE8X8NtgmkUOJFXOn9ESSCXguIZ7PJu8OBJIr7KGww41Vf/Pbgko+PgWQ55g==, tarball: https://codeload.github.com/whiskeysockets/libsignal-node/tar.gz/bcea72df9ec34d9d9140ab30619cf479c7c144c7}
+    resolution: {gitHosted: true, tarball: https://codeload.github.com/whiskeysockets/libsignal-node/tar.gz/bcea72df9ec34d9d9140ab30619cf479c7c144c7}
     version: 6.0.0
 
   lightningcss-android-arm64@1.32.0:
@@ -2221,6 +2233,8 @@ snapshots:
       keyv: 5.6.0
 
   '@keyv/serialize@1.1.1': {}
+
+  '@nanoco/nanoclaw-dashboard@0.3.0(patch_hash=c08134b981b538862e8fbbe35f777fdd6fc3c40b83fd941d4db07c2d5ecbc05c)': {}
 
   '@napi-rs/wasm-runtime@1.1.4(@emnapi/core@1.9.2)(@emnapi/runtime@1.9.2)':
     dependencies:

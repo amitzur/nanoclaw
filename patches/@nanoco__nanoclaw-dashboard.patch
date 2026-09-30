@@ -1,0 +1,21 @@
+diff --git a/dist/server.js b/dist/server.js
+index f616ef5adfe7763270aa56d9685c1843819202de..2b08e3dfc61e39375e144fd13fea3d3cda26728c 100644
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -23,7 +23,6 @@ export function startDashboard(config = {}) {
+         const path = url.pathname;
+         const method = req.method || 'GET';
+         // CORS
+-        res.setHeader('Access-Control-Allow-Origin', '*');
+         res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+         if (method === 'OPTIONS') {
+             res.writeHead(204);
+@@ -65,7 +64,7 @@ export function startDashboard(config = {}) {
+             }
+         }
+     });
+-    server.listen(port, '0.0.0.0', () => {
++    server.listen(port, '127.0.0.1', () => {
+         console.log(`[dashboard] Started on http://localhost:${port}/dashboard`);
+     });
+ }

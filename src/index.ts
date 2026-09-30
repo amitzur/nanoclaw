@@ -201,6 +201,10 @@ async function main(): Promise<void> {
   // 9. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
+  // Dashboard (optional; no-ops without DASHBOARD_SECRET)
+  const { startDashboard } = await import('./dashboard-pusher.js');
+  await startDashboard();
+
   log.info('NanoClaw running');
 }
 
