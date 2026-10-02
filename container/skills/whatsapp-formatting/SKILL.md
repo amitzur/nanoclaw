@@ -1,6 +1,6 @@
 ---
 name: whatsapp-formatting
-description: Format messages for WhatsApp, including mentions that render as real WhatsApp tags. Use when responding in a WhatsApp conversation (platform_id / chatJid ends with @s.whatsapp.net or @g.us).
+description: Format messages for WhatsApp, including mentions that render as real WhatsApp tags, and when to react with an emoji instead of replying. Use when responding in a WhatsApp conversation (platform_id / chatJid ends with @s.whatsapp.net or @g.us).
 ---
 
 # WhatsApp Message Formatting
@@ -59,3 +59,19 @@ The adapter converts standard Markdown (`**bold**`, `[link](url)`, `# heading`) 
 - Don't write `<@U123>` (that's Slack), `<@!123>` (Discord), or any other channel's mention syntax.
 - Don't paste a full JID like `@15551234567@s.whatsapp.net` in the text — only the digits before the JID's `@` go after your `@`.
 - Don't try to tag display names. WhatsApp has no display-name-based mention API.
+
+## Reactions
+
+WhatsApp users react to messages constantly, and a reaction often fits better than a reply. Use `add_reaction` with the message's `#N` id. Pass either the emoji itself (`👍`) or its name (`thumbs_up`, `heart`, `check`, `eyes`); the adapter converts names to the emoji.
+
+React **instead of replying** when a reply would add nothing:
+- Thanks, "ok", "got it", "👍", or a sign-off: ❤️ or 👍.
+- A photo, link, or bit of news shared with no question: ❤️, 😂, or 👍, whichever fits.
+- Confirming you did exactly what was asked, when there's nothing to report: ✅.
+
+React **and then reply** when a request will take a while: 👀 on the request as you start, so the person knows you're on it, then the full reply when you're done.
+
+Don't:
+- React and also send a message that says the same thing ("👍" plus "Got it!").
+- React to every message. Reply normally to questions and anything that needs an answer.
+- Stack reactions. WhatsApp allows one reaction per person per message, so a second one replaces the first.
