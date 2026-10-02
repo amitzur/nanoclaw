@@ -26,6 +26,7 @@ import path from 'path';
 // The named export resolves to the callable function.
 import { pino } from 'pino';
 
+import { defaultEmojiResolver } from 'chat';
 import {
   makeWASocket,
   proto,
@@ -106,6 +107,7 @@ const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
+const INBOUND_KEY_CACHE_MAX = 512;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
 
@@ -614,6 +616,65 @@ function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?
  * 'false', any other string — means the bot rides the operator's personal
  * number (shared). Exported for unit testing the truth table.
  */
+const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
+
+/**
+ * Resolve the agent's `add_reaction` emoji to the literal character WhatsApp
+ * needs. The tool is channel-agnostic, so agents pass names (`thumbs_up`,
+ * Slack aliases like `+1`, `:eyes:`) as often as the emoji itself, and
+ * WhatsApp only renders a reaction whose text is the emoji. Returns
+ * undefined for a name the shared Chat SDK resolver doesn't know.
+ */
+export function resolveReactionEmoji(input: string): string | undefined {
+  const raw = input.trim();
+  if (!raw) return undefined;
+  if (PICTOGRAPHIC.test(raw)) return raw;
+  const name = raw.replace(/^:|:$/g, '');
+  for (const candidate of [
+    defaultEmojiResolver.toGChat(name),
+    defaultEmojiResolver.toGChat(defaultEmojiResolver.fromSlack(name)),
+  ]) {
+    if (PICTOGRAPHIC.test(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Build the key a reaction targets. WhatsApp matches a reaction to its
+ * message by the full key — in groups that includes the original sender
+ * (`participant`), without which the reaction is silently dropped. Inbound
+ * messages are reacted to with the key exactly as received; anything not
+ * in the inbound cache (older than the cache, or sent before a restart)
+ * falls back to a DM-shaped key.
+ */
+/**
+ * Recover the WhatsApp message id from the id `add_reaction` hands over. The
+ * router namespaces inbound ids per agent (`<waId>:<agentGroupId>`, see
+ * messageIdForAgent in src/router.ts) and the agent-runner passes that
+ * namespaced id through as-is; WhatsApp ignores a reaction whose key id it
+ * doesn't know. WhatsApp ids never contain a colon.
+ */
+export function stripAgentNamespace(messageId: string): string {
+  return messageId.replace(/:ag-[^:]+$/, '');
+}
+
+export function buildReactionKey(
+  platformId: string,
+  messageId: string,
+  inboundKey: WAMessageKey | undefined,
+  sentByBot: boolean,
+): WAMessageKey {
+  if (inboundKey) {
+    return {
+      remoteJid: inboundKey.remoteJid || platformId,
+      id: messageId,
+      fromMe: inboundKey.fromMe ?? false,
+      ...(inboundKey.participant ? { participant: inboundKey.participant } : {}),
+    };
+  }
+  return { remoteJid: platformId, id: messageId, fromMe: sentByBot };
+}
+
 export function resolveSharedMode(assistantHasOwnNumber: string | undefined): boolean {
   return assistantHasOwnNumber !== 'true';
 }
@@ -682,6 +743,10 @@ registerChannelAdapter('whatsapp', {
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+
+    // Inbound message keys as received, so a reaction can target the exact
+    // key (groups need the original sender's participant id)
+    const inboundKeyCache = new Map<string, WAMessageKey>();
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -1213,6 +1278,13 @@ registerChannelAdapter('whatsapp', {
                   !hasMentionPills(normalized) &&
                   isBotTypedMention(content, ASSISTANT_NAME, botPhoneJid)));
 
+            if (msg.key.id) {
+              inboundKeyCache.set(msg.key.id, msg.key);
+              if (inboundKeyCache.size > INBOUND_KEY_CACHE_MAX) {
+                inboundKeyCache.delete(inboundKeyCache.keys().next().value!);
+              }
+            }
+
             const inbound: InboundMessage = {
               id: msg.key.id || `wa-${Date.now()}`,
               kind: 'chat',
@@ -1359,15 +1431,22 @@ registerChannelAdapter('whatsapp', {
 
         // Reaction → emoji on a message
         if (content.operation === 'reaction' && content.messageId && content.emoji) {
+          const messageId = stripAgentNamespace(content.messageId as string);
+          const emoji = resolveReactionEmoji(content.emoji as string);
+          if (!emoji) {
+            log.warn('Unknown reaction emoji — skipping', { platformId, emoji: content.emoji });
+            return;
+          }
+          const key = buildReactionKey(
+            platformId,
+            messageId,
+            inboundKeyCache.get(messageId),
+            sentMessageCache.has(messageId),
+          );
           try {
-            await sock.sendMessage(platformId, {
-              react: {
-                text: content.emoji as string,
-                key: { remoteJid: platformId, id: content.messageId as string, fromMe: false },
-              },
-            });
+            await sock.sendMessage(platformId, { react: { text: emoji, key } });
           } catch (err) {
-            log.debug('Failed to send reaction', { platformId, err });
+            log.warn('Failed to send reaction', { platformId, messageId, err });
           }
           return;
         }
