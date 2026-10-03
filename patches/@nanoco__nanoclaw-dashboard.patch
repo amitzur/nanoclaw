@@ -1,3 +1,36 @@
+diff --git a/dist/router.js b/dist/router.js
+index 326434d184af3d5496de61b07c79bca0ceff7e7f..5cf4f4d974473edb2ace2a7ad776571ae0774bae 100644
+--- a/dist/router.js
++++ b/dist/router.js
+@@ -4,6 +4,7 @@ import { agentGroupsPage } from './ui/pages/agent-groups.js';
+ import { sessionsPage } from './ui/pages/sessions.js';
+ import { channelsPage } from './ui/pages/channels.js';
+ import { messagesPage } from './ui/pages/messages.js';
++import { agentMessagesPage } from './ui/pages/agent-messages.js';
+ import { usersPage } from './ui/pages/users.js';
+ import { logsPage } from './ui/pages/logs.js';
+ function json(res, data, status = 200) {
+@@ -99,6 +100,11 @@ export async function dispatch(method, path, params, res) {
+         const match = msgs?.find((m) => m.agentGroupId === agentGroupId && m.sessionId === sessionId);
+         return json(res, match || { inbound: [], outbound: [] });
+     }
++    if (method === 'GET' && path === '/api/agent-messages') {
++        if (!s)
++            return json(res, { error: 'No data yet' }, 503);
++        return json(res, s.agent_messages || []);
++    }
+     if (method === 'GET' && path === '/api/users') {
+         if (!s)
+             return json(res, { error: 'No data yet' }, 503);
+@@ -124,6 +130,8 @@ export async function dispatch(method, path, params, res) {
+             return html(res, sessionsPage());
+         if (path === '/dashboard/channels')
+             return html(res, channelsPage());
++        if (path === '/dashboard/agent-messages')
++            return html(res, agentMessagesPage());
+         if (path.startsWith('/dashboard/messages'))
+             return html(res, messagesPage());
+         if (path === '/dashboard/users')
 diff --git a/dist/server.js b/dist/server.js
 index f616ef5adfe7763270aa56d9685c1843819202de..2b08e3dfc61e39375e144fd13fea3d3cda26728c 100644
 --- a/dist/server.js
@@ -19,3 +52,116 @@ index f616ef5adfe7763270aa56d9685c1843819202de..2b08e3dfc61e39375e144fd13fea3d3c
          console.log(`[dashboard] Started on http://localhost:${port}/dashboard`);
      });
  }
+diff --git a/dist/ui/layout.js b/dist/ui/layout.js
+index 36b957573fba3d5046e9b50f844aefb9fde486e8..861cbd1e009cea4f46dac476a2dd0d1c908eace3 100644
+--- a/dist/ui/layout.js
++++ b/dist/ui/layout.js
+@@ -9,6 +9,7 @@ const NAV_ITEMS = [
+     { href: '/dashboard/sessions', label: 'Sessions', icon: '&#8635;' },
+     { href: '/dashboard/channels', label: 'Channels', icon: '&#8644;' },
+     { href: '/dashboard/messages', label: 'Messages', icon: '&#9993;' },
++    { href: '/dashboard/agent-messages', label: 'Agent Messages', icon: '&#8646;' },
+     { href: '/dashboard/users', label: 'Users', icon: '&#9679;' },
+     { href: '/dashboard/logs', label: 'Logs', icon: '&#9776;' },
+ ];
+diff --git a/dist/ui/pages/agent-messages.js b/dist/ui/pages/agent-messages.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..4aec3cf4fb4b7c844672caf65e8d30908f9cd3be
+--- /dev/null
++++ b/dist/ui/pages/agent-messages.js
+@@ -0,0 +1,95 @@
++import { layout } from '../layout.js';
++export function agentMessagesPage() {
++    return layout('Agent Messages', '/dashboard/agent-messages', `
++    <h2 class="page-title">Agent Messages</h2>
++    <div id="filters" style="display:flex;gap:12px;align-items:center;margin-bottom:16px;font-size:13px;color:#888">
++      <label>Agent <select id="f-agent"><option value="">All</option></select></label>
++      <label>Conversation <select id="f-pair"><option value="">All</option></select></label>
++      <input id="f-text" type="search" placeholder="Search text..." style="padding:4px 8px;background:#1a1a1a;color:#e0e0e0;border:1px solid #2a2a2a;border-radius:4px">
++      <span id="count"></span>
++    </div>
++    <div id="content"><div class="loading">Loading...</div></div>
++    <style>
++      #filters select { background:#1a1a1a;color:#e0e0e0;border:1px solid #2a2a2a;border-radius:4px;padding:4px 6px; }
++      .a2a-text { white-space:pre-wrap;word-break:break-word;font-size:12px;max-width:720px; }
++      .a2a-text details summary { cursor:pointer;color:#7eb8da; }
++      .a2a-route { white-space:nowrap;font-size:12px; }
++      .a2a-route .arrow { color:#666;margin:0 4px; }
++      .a2a-sess { font-size:11px;color:#666; }
++    </style>
++    <script>
++    (() => {
++      let all = [];
++      const PREVIEW = 400;
++      const pairKey = (m) => [m.fromAgentGroupId, m.toAgentGroupId].sort().join('|');
++      const pairLabel = (m) => [m.fromAgentGroupName, m.toAgentGroupName].sort().join(' \\u2194 ');
++      const statusColor = (s) => s === 'completed' ? 'green' : s === 'failed' ? 'red' : s === 'pending' ? 'yellow' : 'gray';
++      const sessLink = (ag, sess) => '<a class="a2a-sess" href="/dashboard/messages?agentGroupId=' + encodeURIComponent(ag) + '&sessionId=' + encodeURIComponent(sess) + '">' + esc(sess) + '</a>';
++
++      function fillSelect(id, entries) {
++        const sel = document.getElementById(id);
++        const cur = sel.value;
++        sel.innerHTML = '<option value="">All</option>' + entries.map(([v, l]) => '<option value="' + esc(v) + '">' + esc(l) + '</option>').join('');
++        sel.value = entries.some(([v]) => v === cur) ? cur : '';
++      }
++
++      function render() {
++        const agent = document.getElementById('f-agent').value;
++        const pair = document.getElementById('f-pair').value;
++        const q = document.getElementById('f-text').value.trim().toLowerCase();
++        const rows = all.filter((m) =>
++          (!agent || m.fromAgentGroupId === agent || m.toAgentGroupId === agent) &&
++          (!pair || pairKey(m) === pair) &&
++          (!q || (m.text || '').toLowerCase().includes(q)));
++        document.getElementById('count').textContent = rows.length + ' of ' + all.length + ' messages';
++        if (rows.length === 0) {
++          document.getElementById('content').innerHTML = '<div class="loading">No agent-to-agent messages</div>';
++          return;
++        }
++        let html = '<table><tr><th>Time</th><th>From \\u2192 To</th><th>Status</th><th>Message</th></tr>';
++        for (const m of rows) {
++          const text = m.text || '';
++          const body = text.length > PREVIEW
++            ? '<details><summary>' + esc(text.slice(0, PREVIEW)) + '\\u2026</summary>' + esc(text.slice(PREVIEW)) + '</details>'
++            : esc(text);
++          const att = m.attachments ? ' ' + badge(m.attachments + ' file' + (m.attachments > 1 ? 's' : ''), 'purple') : '';
++          html += '<tr>' +
++            '<td style="white-space:nowrap;font-size:12px;color:#888" title="' + esc(m.timestamp) + '">' + esc(new Date(m.timestamp).toLocaleString()) + '<br>' + timeAgo(m.timestamp) + '</td>' +
++            '<td class="a2a-route">' + badge(m.fromAgentGroupName || '?', 'blue') + '<span class="arrow">\\u2192</span>' + badge(m.toAgentGroupName || '?', 'green') +
++              '<br>' + sessLink(m.fromAgentGroupId, m.fromSessionId) + '<br>' + sessLink(m.toAgentGroupId, m.toSessionId) + '</td>' +
++            '<td>' + badge(m.status || '-', statusColor(m.status)) + '</td>' +
++            '<td class="a2a-text">' + body + att + '</td>' +
++            '</tr>';
++        }
++        html += '</table>';
++        document.getElementById('content').innerHTML = html;
++      }
++
++      async function load() {
++        try {
++          all = await api('/api/agent-messages');
++        } catch (e) {
++          document.getElementById('content').innerHTML = '<div class="loading">Error: ' + esc(e.message) + '</div>';
++          return;
++        }
++        const agents = new Map();
++        const pairs = new Map();
++        for (const m of all) {
++          agents.set(m.fromAgentGroupId, m.fromAgentGroupName);
++          agents.set(m.toAgentGroupId, m.toAgentGroupName);
++          pairs.set(pairKey(m), pairLabel(m));
++        }
++        const byLabel = (a, b) => String(a[1]).localeCompare(String(b[1]));
++        fillSelect('f-agent', [...agents].sort(byLabel));
++        fillSelect('f-pair', [...pairs].sort(byLabel));
++        render();
++      }
++
++      for (const id of ['f-agent', 'f-pair']) document.getElementById(id).addEventListener('change', render);
++      document.getElementById('f-text').addEventListener('input', render);
++      load();
++      setInterval(load, 60000);
++    })();
++    </script>
++  `);
++}

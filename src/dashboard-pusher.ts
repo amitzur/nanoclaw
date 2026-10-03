@@ -168,6 +168,7 @@ async function collectSnapshot(): Promise<Record<string, unknown>> {
     context_windows: contextWindows,
     activity: collectActivity(),
     messages: collectMessages(),
+    agent_messages: collectAgentMessages(nameMapFrom(agentGroups)),
   };
 }
 
@@ -574,6 +575,83 @@ function toBucketArray(buckets: Record<string, { inbound: number; outbound: numb
   return Object.entries(buckets)
     .map(([hour, counts]) => ({ hour, ...counts }))
     .sort((a, b) => a.hour.localeCompare(b.hour));
+}
+
+function nameMapFrom(groups: Array<{ id: string; name: string }>): Map<string, string> {
+  return new Map(groups.map((g) => [g.id, g.name]));
+}
+
+/**
+ * Agent-to-agent traffic, read from the receiving side. A routed a2a message
+ * lands in the target session's inbound.db with channel_type='agent' and a
+ * source_session_id; host-written system notes (approvals, restarts) share
+ * channel_type='agent' but carry no source session, so they're excluded.
+ */
+function collectAgentMessages(names: Map<string, string>) {
+  const sessionsDir = path.join(DATA_DIR, 'v2-sessions');
+  if (!fs.existsSync(sessionsDir)) return [];
+
+  const limit = 500;
+  const results: Array<Record<string, unknown>> = [];
+
+  try {
+    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+      const agPath = path.join(sessionsDir, agDir);
+      for (const sessDir of fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'))) {
+        const dbPath = path.join(agPath, sessDir, 'inbound.db');
+        if (!fs.existsSync(dbPath)) continue;
+        try {
+          const db = new Database(dbPath, { readonly: true });
+          const rows = db
+            .prepare(
+              `SELECT id, timestamp, status, platform_id, source_session_id, content FROM messages_in
+               WHERE channel_type = 'agent' AND source_session_id IS NOT NULL
+               ORDER BY seq DESC LIMIT ?`,
+            )
+            .all(limit) as Array<{
+            id: string;
+            timestamp: string;
+            status: string;
+            platform_id: string | null;
+            source_session_id: string;
+            content: string;
+          }>;
+          db.close();
+          for (const r of rows) {
+            let text = r.content;
+            let attachments = 0;
+            try {
+              const parsed = JSON.parse(r.content);
+              if (typeof parsed.text === 'string') text = parsed.text;
+              if (Array.isArray(parsed.attachments)) attachments = parsed.attachments.length;
+            } catch {
+              /* raw content */
+            }
+            results.push({
+              id: r.id,
+              timestamp: r.timestamp,
+              status: r.status,
+              fromAgentGroupId: r.platform_id,
+              fromAgentGroupName: (r.platform_id && names.get(r.platform_id)) || r.platform_id,
+              fromSessionId: r.source_session_id,
+              toAgentGroupId: agDir,
+              toAgentGroupName: names.get(agDir) || agDir,
+              toSessionId: sessDir,
+              text,
+              attachments,
+            });
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+  } catch {
+    /* skip */
+  }
+
+  results.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+  return results.slice(0, limit);
 }
 
 function collectMessages() {
