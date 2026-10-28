@@ -255,6 +255,7 @@ Check these first when something goes wrong:
 | Host logs | `logs/nanoclaw.error.log` first (delivery failures, crash-loop backoff, warnings), then `logs/nanoclaw.log` for the full routing chain |
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step: bootstrap, environment, container, gateway, mounts, service, etc.) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db` (`messages_in`: did the message reach the container?), `outbound.db` (`messages_out`: did the agent produce a response?) |
+| WhatsApp disconnected / logged out (recurs ~every 2 weeks) | Point the user to [docs/whatsapp-relink.md](docs/whatsapp-relink.md) — their re-link runbook (log check → re-auth → restart `nanoclaw-v2-a84d1e4b`) |
 
 Note: container logs are lost after the container exits (`--rm` flag). If the agent silently failed inside the container, there's no persistent log to inspect.
 
