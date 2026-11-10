@@ -1,0 +1,30 @@
+{
+  "name": "nanoclaw-mashov-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only Mashov MCP server for NanoClaw (runs on the host)",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "mashov-mcp": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "start": "node dist/main.js",
+    "setup": "node dist/setup-cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.17",
+    "typescript": "5.9.3",
+    "vitest": "4.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
