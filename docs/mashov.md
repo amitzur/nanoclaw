@@ -61,6 +61,19 @@ If your docker bridge uses another IP (check with `ip -4 addr show docker0`), or
 1. **OneCLI reaches the host.** `tools/mashov-mcp/scripts/check-gateway-reach.sh` makes a request from inside the OneCLI container to `http://host.docker.internal:<port>/mashov/health` and expects `401`.
 2. **Header injection.** A chosen agent runs `curl -s -o /dev/null -w '%{http_code}' http://host.docker.internal:8787/mashov/health`. `200` means OneCLI injected the token.
 3. **Smoke test.** Ask a chosen agent "who are my kids in Mashov?"; it should call `mashov_children`. A group you did not choose should get `403` from the same `curl`.
+4. **No leak into containers.** After gate 3, run this from the NanoClaw repo on the host. It searches the agent workspaces, session databases and the running containers for Mashov cookie or CSRF names and for the configured password. It must print nothing:
+
+   ```bash
+   PW_FILE=$(mktemp) && node -e 'const c=require(require("os").homedir()+"/.config/nanoclaw-mashov/config.json");process.stdout.write(c.password+"\n"+c.username+"\n")' > "$PW_FILE"
+   grep -rlaE 'MashovSessionID|Csrf-Token|x-csrf-token' groups data 2>/dev/null
+   grep -rlaF -f "$PW_FILE" groups data 2>/dev/null
+   for c in $(docker ps --format '{{.Names}}' | grep -i nanoclaw); do
+     docker exec "$c" sh -c 'env; grep -rlaE "MashovSessionID|Csrf-Token|x-csrf-token" /workspace /home 2>/dev/null' | grep -iE 'mashov|csrf' && echo "LEAK in $c"
+   done
+   rm -f "$PW_FILE"
+   ```
+
+   The automated counterpart is `test/no-leak.test.ts`. It checks the raw HTTP response (every header and the full body) and the host log for every tool, on success and on every upstream failure: 5xx, invalid JSON, 403/404, redirects, login rejection, network errors, re-login, and secrets planted in data rows.
 
 ## Troubleshooting
 

@@ -141,8 +141,9 @@ cd tools/mashov-mcp && pnpm install --frozen-lockfile && pnpm run build
 
 Typecheck it and run its tests. The tests use a synthetic Mashov fake and make
 no network calls. They cover login, re-login, the GET-only rule, bearer
-enforcement, child-name matching, and checks that no credentials, ids, or mail
-bodies leak:
+enforcement, child-name matching, and checks that no cookies, CSRF tokens,
+credentials, ids, or mail bodies reach the agent, including on every upstream
+error path (`test/no-leak.test.ts`):
 
 ```nc:run effect:test
 cd tools/mashov-mcp && pnpm run typecheck && pnpm test
